@@ -1,13 +1,14 @@
 ---
 name: running_tests
-description: How to reproduce an issue and run only the relevant tests, with short output, in a sandbox with no internet.
+description: Reproduce an issue with a scratch script in /tmp and check a fix with one targeted pytest run, without adding files to the patch.
 ---
 
-# Reproducing and testing
+# Reproducing and checking a fix
 
-- **Find the nearest tests.** Look for `tests/test_<module>.py` or grep the tests folder for the function you are changing: `grep -rln "<function_name>" tests | head`.
-- **Run one file or one test, not the suite:** `python -m pytest tests/test_x.py -x -q 2>&1 | tail -n 30`, or `python -m pytest "tests/test_x.py::test_name" -q 2>&1 | tail -n 30`.
-- **Reproduce with a script** when no test covers the issue: write a few lines to `/tmp/repro.py` that trigger the bug, run `python /tmp/repro.py`, and confirm it fails the way the issue says. Keep the script out of the repository so it isn't part of the patch.
-- **Rerun both after the fix:** the reproduction should now pass, and the nearby tests should still pass.
-- **No internet:** `pip install` will fail. If a test needs a missing package, skip that test rather than trying to install it.
-- **Don't edit existing tests** to make them pass. The grader applies its own tests to your patch.
+- **Scratch files go in /tmp, created with run_command.** For example run cat > /tmp/repro.py << 'EOF', then the script lines, then EOF, and run python3 /tmp/repro.py. Don't use write_file for scratch files: it writes under /workspace, and every new file there ends up in the patch.
+- **Quick checks fit on one line:** python3 -c "import pkg; print(pkg.func(1))"
+- **Find the nearest tests** for the code you're changing: grep -rln "function_name" tests | head -n 5
+- **Run one file or one test, never the whole suite:** python3 -m pytest tests/test_x.py -q -x 2>&1 | tail -n 20, or add -k test_name to pick a single test. Your whole task budget is only a few minutes.
+- **After the fix:** the reproduction should now pass, and the nearby tests should still pass.
+- **Leave test files alone.** Edits to tests, conftest.py, pytest.ini, pyproject.toml, setup.cfg and tox.ini are stripped from the patch before grading, so fix the library code instead.
+- **Clean up before you submit:** delete any scratch file you created inside /workspace, then call submit_patch last.

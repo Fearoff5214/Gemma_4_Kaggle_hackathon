@@ -2,7 +2,7 @@
 
 This is the team repo for the [Google - Gemma 4 Developer Agent Competition](https://www.kaggle.com/competitions/gemma-4-developer-agent) on Kaggle. The job is to post-train one Gemma 4 variant into an agent that fixes real repository issues. The score is the share of patched repos that pass their validation tests, as in SWE-bench. The final submission is due **December 2, 2026 at 11:59 PM UTC** (5:29 AM IST on December 3).
 
-**Status, 2026-10-21:** Phase 0 (setup and baseline). A baseline config is in `submission/`, but it hasn't been checked against `HARNESS_README.md` yet and hasn't been submitted. The full plan is in the [six-week plan doc](https://claude.ai/artifact/A9usjMjJLXXoXBT4nXpFax).
+**Status, 2026-10-21:** Phase 0 (setup and baseline). The baseline in `submission/` follows `data/HARNESS_README.md` and the official `data/sample_submission/`, and passes the validator, but it hasn't been submitted. See `docs/harness_notes.md` for the harness facts, `docs/dataset_inventory.md` and `docs/sandbox_environment.md` for the data and sandbox, and `experiments/variants/README.md` for the experiment queue. The full plan is in the [six-week plan doc](https://claude.ai/artifact/A9usjMjJLXXoXBT4nXpFax).
 
 ## Layout
 
@@ -77,15 +77,15 @@ Submission owner: TBD.
 
 ## Rules digest
 
-The rules below come from the [competition overview](https://www.kaggle.com/competitions/gemma-4-developer-agent/overview), as summarised in the team handoff. Anything marked **unconfirmed** comes from other teams' public notes and still needs checking against `data/HARNESS_README.md`.
+The rules below come from the [competition overview](https://www.kaggle.com/competitions/gemma-4-developer-agent/overview), checked against `data/HARNESS_README.md` (§ numbers). Details are in `docs/harness_notes.md`.
 
-- **One base model for every agent and sub-agent.** The choices are `gemma-4-31b-it-qat-w4a16-ct`, `gemma-4-12b-it-qat-w4a16-ct`, `gemma-4-e4b-it-qat-w4a16-ct` and `gemma-4-e2b-it-qat-w4a16-ct`, all QAT w4a16. Each agent can use a different LoRA adapter. **Unconfirmed:** the official Model Selection page still lists only 31b, while a host announcement on October 11 allows all four ([summary of both](https://github.com/jwj1342/gemma-agent-lab/issues/24)).
+- **One base model for every agent and sub-agent.** The choices are `gemma-4-31b-it-qat-w4a16-ct`, `gemma-4-12b-it-qat-w4a16-ct`, `gemma-4-e4b-it-qat-w4a16-ct` and `gemma-4-e2b-it-qat-w4a16-ct`, all QAT w4a16 and all in `ALLOWED_MODEL_NAMES` (§3.2). Each agent can use a different LoRA adapter.
 - **Submission format.** A `submission.zip` with `agent.yaml` (a Google ADK Agent Config) at its root. Prompts, sub-agents, skills and PEFT LoRA adapters are optional.
-- **Nothing outside the archive.** `!include` paths must stay inside the zip. `../` and symlinks are not allowed.
+- **Nothing outside the archive.** `!include` paths must stay inside the zip, and symlinks aren't allowed. Paths resolve from the including file's folder. The overview bans `../`, so keep agent YAML at the root (§2.2, `docs/decisions.md`).
 - **Harness tools only.** The agent may use `run_command`, `read_file`, `edit_file`, `write_file`, `submit_patch` and `get_status`, plus three code-graph tools: `get_code_neighbors`, `search_similar_code` and `get_code_subgraph`.
-- **Time budget.** 12 hours for all tasks, including sandbox setup but not patch validation. Per-task limits go in `eval_config.yaml`. **Unconfirmed:** tasks run one after another, and going over 12 hours fails the whole submission.
+- **Time budget.** 12 hours for all tasks, including sandbox setup but not patch validation. Per-task limits go in `eval_config.yaml` under `evaluation:`. Without them the default is 60 min per task (§7.1). **Unconfirmed:** whether the scorer runs tasks one after another; our budget assumes it does.
 - **Compute.** Kaggle L4x4 (96 GB of GPU memory), only in notebooks attached to the competition, with the internet off. These use GPU quota at twice the normal rate.
-- **Tasks. Unconfirmed:** a public dev set of 129 tasks (fastapi, rich, requests, httpx) and a hidden test set of about 120 tasks from private Python repos.
+- **Tasks.** The public dev set is 129 tasks in `data/tasks.jsonl`: fastapi 67, rich 48, requests 13 and httpx 1 (`docs/dataset_inventory.md`). **Unconfirmed:** a hidden test set of about 120 tasks from private Python repos.
 
 ## Key dates
 
@@ -99,6 +99,7 @@ All deadlines are at 11:59 PM UTC.
 
 ## Known limits
 
-- Until someone reads `data/HARNESS_README.md`, the config in `submission/` and the validation rules are based on the ADK schema and other teams' notes. Treat both as unconfirmed.
+- The dataset ships no harness package (`swegemma`), so there's no local `swegemma eval` yet. Look for it on the competition's Code and Discussion tabs.
+- The budget check assumes about 120 hidden tasks run one after another, with about 60 s of setup each. Pass `--tasks` and `--setup-seconds` to the build script to change those assumptions.
 - The build script checks only the rules we know about. It doesn't run the agent and can't predict a score.
 - Adapter weights (`*.safetensors`) are git-ignored, so share them another way, such as a private Kaggle dataset.

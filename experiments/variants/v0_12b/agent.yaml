@@ -1,25 +1,20 @@
-# yaml-language-server: $schema=https://raw.githubusercontent.com/google/adk-python/refs/heads/main/src/google/adk/agents/config_schemas/AgentConfig.json
+# Variant v0_12b: baseline v0 with the 12B model, the only change. 12B is in
+# ALLOWED_MODEL_NAMES (HARNESS_README.md 3.2) and reportedly about twice as
+# fast as 31b on 4xL4, so the same 4 minutes buy more turns.
 #
-# Variant v0_12b: baseline v0 with the 12B model. One change against
-# submission/: the model id. Reportedly about twice as fast as 31b on 4xL4,
-# so the same time limit buys more turns.
-#
-# Don't submit until the host or HARNESS_README.md confirms 12B is accepted:
-# the Model Selection page still says 31b only (see docs/decisions.md).
-# The host says vLLM serves 12B with --hf-overrides; that is the harness's
-# concern, not something this config sets.
-agent_class: LlmAgent
+# Format: the harness's SandboxedAgentConfig (data/HARNESS_README.md section
+# 2.3), as in data/sample_submission/agent.yaml. Tools are bare names.
 name: swe_agent
 model: gemma-4-12b-it-qat-w4a16-ct
 description: Fixes one GitHub issue in a Python repository and submits the patch.
 instruction: !include prompts/system.md
 tools:
-  - name: run_command
-  - name: read_file
-  - name: edit_file
-  - name: write_file
-  - name: get_code_neighbors
-  - name: search_similar_code
-  - name: get_code_subgraph
-  - name: get_status
-  - name: submit_patch
+  - run_command
+  - read_file
+  - edit_file
+  - write_file
+  - get_status
+  - submit_patch
+  - get_code_neighbors
+  - search_similar_code
+  - get_code_subgraph

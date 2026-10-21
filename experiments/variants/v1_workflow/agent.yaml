@@ -1,22 +1,19 @@
-# yaml-language-server: $schema=https://raw.githubusercontent.com/google/adk-python/refs/heads/main/src/google/adk/agents/config_schemas/AgentConfig.json
+# Variant v1_workflow: baseline v0 with the explicit workflow prompt. The only
+# change is prompts/system.md.
 #
-# Variant v1: explicit workflow prompt with graph-tools-first navigation.
-# One change against baseline v0 (submission/): prompts/system.md.
-# Build: python scripts/build_submission.py --src experiments/variants/v1_workflow
-#
-# UNVERIFIED until data/HARNESS_README.md is read, like the baseline.
-agent_class: LlmAgent
+# Format: the harness's SandboxedAgentConfig (data/HARNESS_README.md section
+# 2.3), as in data/sample_submission/agent.yaml. Tools are bare names.
 name: swe_agent
 model: gemma-4-31b-it-qat-w4a16-ct
 description: Fixes one GitHub issue in a Python repository and submits the patch.
 instruction: !include prompts/system.md
 tools:
-  - name: run_command
-  - name: read_file
-  - name: edit_file
-  - name: write_file
-  - name: get_code_neighbors
-  - name: search_similar_code
-  - name: get_code_subgraph
-  - name: get_status
-  - name: submit_patch
+  - run_command
+  - read_file
+  - edit_file
+  - write_file
+  - get_status
+  - submit_patch
+  - get_code_neighbors
+  - search_similar_code
+  - get_code_subgraph

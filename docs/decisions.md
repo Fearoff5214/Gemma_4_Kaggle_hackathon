@@ -1,6 +1,17 @@
 # Decision log
 
-Newest first. Each entry gives the decision, why it was made, the alternative, and when to revisit it.
+Newest first. Each entry gives the decision, why it was made, the alternative, and when to revisit it. Section numbers (§) refer to `data/HARNESS_README.md`.
+
+## 2026-10-21: eval_config uses the official `evaluation:` keys
+
+- **Decision:** `evaluation:` sets `max_time_minutes: 4`, `max_tool_calls: 60`, `max_turns: 100` and `timeout_seconds: 120`.
+- **Why:**
+  - 120 tasks × (4 min + about 1 min setup) = 10 h, under the 12 h cap. Without the file, the 60 min default per task would blow the cap (§7.1).
+  - Time is the binding limit. The call and turn caps are backstops.
+  - 120 s per command stops one slow test run from using up half the session.
+  - The scorer's concurrency isn't documented, so assume tasks run one after another.
+- **Alternative:** looser limits. Those would only fit if the scorer runs tasks in parallel or the hidden set is smaller than about 120 tasks.
+- **Revisit:** after the first scored run reports its runtime, and once local `swegemma eval` runs show how long dev tasks really take.
 
 ## 2026-10-21: Baseline v0 uses a plain prompt; the workflow prompt is variant v1
 
@@ -11,20 +22,15 @@ Newest first. Each entry gives the decision, why it was made, the alternative, a
 
 ## 2026-10-21: Baseline model is gemma-4-31b-it-qat-w4a16-ct
 
-- **Decision:** every agent uses 31b until the allowed-model question is settled.
-- **Why:** 31b is the only model every official source allows. The Model Selection page says 31b only, the host's Oct 11 post allows all four, and the scoring script's allow-list isn't public. A rejected baseline would waste a day's submission.
-- **Alternative:** 12B. It's reportedly about twice as fast (67 vs 35 tokens/s on 4×L4), so it gets more turns per task, and the plan prefers it for iterating.
-- **Revisit:** when `HARNESS_README.md` or the host confirms 12B. Then run the same config on 12B as a one-change experiment.
+- **Decision:** the baseline uses 31b, the starter-kit default.
+- **Why:** the README lists all four models in `ALLOWED_MODEL_NAMES` (§3.1, §3.2), so 12B is allowed too. That settles the conflict between the Model Selection page and the host's Oct 11 post. 31b stays the baseline as the starter-kit default.
+- **Alternative:** 12B. It's reportedly about twice as fast (67 vs 35 tokens/s on 4×L4), so it gets more turns per task, and the plan prefers it for iterating. `v0_12b` is now unblocked.
+- **Revisit now:** compare v0 and v0_12b locally with `swegemma eval` on the dev set before spending submissions on either.
 
-## 2026-10-21: Per-task limits are 240 s and 40 turns
+## 2026-10-21: Agent YAML stays at the archive root, so no path needs `..`
 
-- **Decision:** `per_task_timeout_seconds: 240` and `max_turns_per_task: 40`.
-- **Why:** 120 tasks × (240 s + about 60 s of setup) = 10 h, under the 12 h cap. Going over the cap fails the whole submission.
-- **Alternative:** the harness defaults, which are unknown, or the sample's 1 min, which is too short to fix anything.
-- **Revisit:** once the README confirms the task count, the setup time and the key names, and again after the first run reports its real runtime.
-
-## 2026-10-21: `!include` paths are resolved from the archive root, and agent YAML stays at the root
-
-- **Decision:** the validator resolves `!include` from the archive root and warns about includes in files below the root. All agent YAML files live at the archive root.
-- **Why:** the rules ban `..`. That only makes sense if paths never need to climb out of a subfolder, which suggests root-relative paths. With every agent at the root, root-relative and file-relative resolution give the same answer.
-- **Revisit:** when the README states how includes are resolved.
+- **Decision:** every agent YAML file lives at the archive root (the v3 analyzer is `analyzer.yaml`, not `sub_agents/…`). The validator resolves `!include`, `config_path` and skill paths from the including file's folder. It warns on `..` that stays inside the archive and rejects `..` that escapes it.
+- **Why:**
+  - The official `data/sample_submission/sub_agents/code_analyzer.yaml` includes `../prompts/analyzer.md`. Paths are therefore file-relative, and the harness accepts `..` inside the archive. This replaces our earlier guess that paths were root-relative.
+  - The competition overview says `../` isn't allowed. With every agent at the root, no path needs it, and both readings agree.
+- **Revisit:** only if a config ever needs agent files in subfolders.

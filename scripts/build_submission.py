@@ -5,15 +5,16 @@ Usage:
     python scripts/build_submission.py --check-only     # check only, write nothing
     python scripts/build_submission.py --src experiments/variants/v1_workflow
 
-The checks encode the competition rules we know of. Constants marked
-UNVERIFIED come from other teams' notes, not from the official harness, and
-must be confirmed against data/HARNESS_README.md before a real submission.
+The rules follow data/HARNESS_README.md (the dataset's harness guide, version
+of 2026-10-13); section numbers are cited next to each one. Values marked
+ESTIMATE are our own assumptions, not harness facts.
 """
 
 from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import os
 import re
 import shutil
@@ -26,33 +27,75 @@ import yaml
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
+# 2.2: exactly one root config must sit at the archive root.
+ROOT_CONFIG_NAMES = ("agent.yaml", "agent.yml", "root_agent.yaml", "root_agent.yml")
+# 3.2: ALLOWED_MODEL_NAMES. Provider prefixes are stripped before comparing.
 ALLOWED_MODELS = frozenset({
     "gemma-4-31b-it-qat-w4a16-ct",
-    # UNVERIFIED: allowed by the host's Oct 11 post, but the Model Selection
-    # page still says 31b only.
     "gemma-4-12b-it-qat-w4a16-ct",
     "gemma-4-e4b-it-qat-w4a16-ct",
     "gemma-4-e2b-it-qat-w4a16-ct",
 })
+MODEL_PREFIXES = ("openai/", "google/", "hosted_vllm/", "custom/")
+# 6: the nine harness tools, attached by bare name.
 HARNESS_TOOLS = frozenset({
-    "run_command", "read_file", "edit_file", "write_file", "submit_patch", "get_status",
+    "run_command", "submit_patch", "get_status", "read_file", "edit_file", "write_file",
     "get_code_neighbors", "search_similar_code", "get_code_subgraph",
 })
-# The harness adds these when an agent lists skills; declaring them yourself
-# reportedly fails compilation. UNVERIFIED.
-SKILL_TOOLS = frozenset({"run_skill_script", "load_skill_resource"})
-# ADK resolves a bare class name from google.adk.tools, or a dotted path.
-AGENT_TOOL_NAMES = frozenset({"AgentTool", "google.adk.tools.agent_tool.AgentTool"})
-ALLOWED_SUFFIXES = frozenset({".yaml", ".yml", ".md", ".txt", ".py", ".json", ".safetensors"})  # UNVERIFIED
+# 5.3: ADK SkillToolset tools. They come with `skills:` and are not declared as tools.
+SKILL_TOOLS = frozenset({"load_skill", "load_skill_resource", "run_skill_script"})
+# 2.3: SandboxedAgentConfig fields per agent class.
+CALLBACK_KEYS = frozenset({
+    "before_agent_callbacks", "after_agent_callbacks", "before_model_callbacks",
+    "after_model_callbacks", "before_tool_callbacks", "after_tool_callbacks",
+})
+LLM_AGENT_KEYS = frozenset({
+    "agent_class", "name", "model", "adapter", "description", "instruction", "global_instruction",
+    "tools", "skills", "sub_agents", "output_key", "include_contents",
+    "disallow_transfer_to_parent", "disallow_transfer_to_peers", "generate_content_config",
+}) | CALLBACK_KEYS
+WORKFLOW_AGENT_KEYS = frozenset({"agent_class", "name", "description", "sub_agents", "max_iterations"}) | CALLBACK_KEYS
+AGENT_CLASSES = ("LlmAgent", "SequentialAgent", "ParallelAgent", "LoopAgent")
+# 2.4: generation constraints.
+GEN_KEYS = frozenset({
+    "temperature", "top_p", "top_k", "max_output_tokens", "presence_penalty", "frequency_penalty",
+    "stop_sequences", "response_mime_type", "seed", "thinking_config",
+})
+GEN_FORBIDDEN = frozenset({"tools", "system_instruction", "http_options", "safety_settings", "response_schema"})
+THINKING_LEVELS = frozenset({"MINIMAL", "LOW", "MEDIUM", "HIGH", "NONE"})
+MAX_CONTEXT_TOKENS = 32_768
+# 2.4: structural limits.
+MAX_TOTAL_BYTES = 3_221_225_472  # total unpacked size must stay below this, adapters included
+MAX_FILES = 10_000
+MAX_YAML_FILES = 1_000
+MAX_YAML_BYTES = 50 * 1024 * 1024
+MAX_SKILL_BYTES = 50 * 1024 * 1024
+MAX_SKILLS = 1_000
+MAX_AGENTS = 500
+MAX_INSTRUCTION_CHARS = 1_000_000
+MAX_TOTAL_INSTRUCTION_CHARS = 10_000_000
+MAX_INCLUDE_DEPTH = 10
+MAX_LOOP_ITERATIONS = 500
+MAX_LORA_RANK = 128  # 3.1
+ALLOWED_SUFFIXES = frozenset({".yaml", ".yml", ".md", ".txt", ".py", ".json", ".safetensors"})
+ADAPTER_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")  # 3.4
 ADAPTER_FILES = ("adapter_config.json", "adapter_model.safetensors")
+# 5.1: session state the harness sets. `hints` exists only when the task has hints.
+STATE_VARS = frozenset({"problem_description"})
+OPTIONAL_STATE_VARS = frozenset({"hints"})
+# ADK replaces {name} in instructions with session state (and raises KeyError when it's missing).
+TEMPLATE = re.compile(r"\{+[^{}]*\}+")
+STATE_NAME = re.compile(r"(?:(?:app|user|temp):)?[A-Za-z_][A-Za-z0-9_]*\Z")
+# 7.1: eval_config.yaml keys under `evaluation:`, with the scorer's defaults.
+EVAL_DEFAULTS = {"max_time_minutes": 60.0, "max_tool_calls": 100, "max_turns": 500, "timeout_seconds": 300}
 
-# Budget model: tasks run one after another under one cap. UNVERIFIED: the task
-# count and setup time are estimates; override them with --tasks/--setup-seconds.
+# The competition's 12 h cap covers every task, sandbox setup included (setup is
+# excluded from max_time_minutes, 7.1). ESTIMATE: the hidden task count, setup
+# time per task, and that the scorer runs tasks one after another.
 TIME_CAP_SECONDS = 12 * 3600
 HIDDEN_TASKS = 120
 SETUP_SECONDS_PER_TASK = 60
 WARN_FRACTION = 0.9
-TIMEOUT_KEY = "per_task_timeout_seconds"  # UNVERIFIED
 
 FIXED_ZIP_TIME = (1980, 1, 1, 0, 0, 0)  # constant timestamps keep builds byte-identical
 
@@ -90,29 +133,48 @@ class _Checker:
         self.tasks = tasks
         self.setup_seconds = setup_seconds
         self.report = Report()
-        self.agents_seen: set[Path] = set()
-        self.includes_seen: set[Path] = set()
+        self.agent_files: set[Path] = set()
+        self.include_targets: dict[tuple[Path, str], Path | None] = {}  # (folder, raw path) -> checked target
+        self.include_stack: set[Path] = set()
         self.models: dict[str, str] = {}
+        self.output_keys: set[str] = set()
+        self.templates: list[tuple[str, str, bool]] = []  # (where, state name, optional)
+        self.instruction_chars = 0
+        self.agent_count = 0
+
+    def error(self, message: str) -> None:
+        self.report.errors.append(message)
+
+    def warn(self, message: str) -> None:
+        self.report.warnings.append(message)
+
+    def note(self, message: str) -> None:
+        self.report.notes.append(message)
 
     def rel(self, path: Path) -> str:
         return path.relative_to(self.src).as_posix()
 
     def run(self) -> Report:
         self.report.files = self.walk_files()
-        root_agent = self.src / "agent.yaml"
-        if root_agent.is_file():
-            self.check_agent(root_agent, is_root=True)
-        else:
-            nested = [self.rel(p) for p in self.report.files if p.name == "agent.yaml"]
+        self.check_sizes()
+        roots = [self.src / name for name in ROOT_CONFIG_NAMES if (self.src / name).is_file()]
+        if not roots:
+            nested = [self.rel(p) for p in self.report.files if p.name in ROOT_CONFIG_NAMES]
             found = f" (found {', '.join(nested)})" if nested else ""
-            self.report.errors.append(f"agent.yaml must be at the archive root{found}")
-        if len(set(self.models.values())) > 1:
-            listing = ", ".join(f"{name}: {model}" for name, model in sorted(self.models.items()))
-            self.report.errors.append(f"every agent must use the same model ({listing})")
-        self.check_skills()
-        self.check_adapters()
+            self.error(f"no root config at the archive root; expected one of {', '.join(ROOT_CONFIG_NAMES)}{found}")
+        elif len(roots) > 1:
+            self.error(f"more than one root config: {', '.join(self.rel(p) for p in roots)} (2.2)")
+        else:
+            self.check_agent_file(roots[0], is_root=True)
+        self.check_standalone_models()
+        self.check_models()
+        self.check_templates()
+        self.check_skill_dirs()
+        self.check_adapter_dirs()
         self.check_budget()
         return self.report
+
+    # Files and paths
 
     def walk_files(self) -> list[Path]:
         files = []
@@ -120,217 +182,409 @@ class _Checker:
             here = Path(dirpath)
             for name in list(dirnames):
                 if _is_link(here / name):
-                    self.report.errors.append(f"{self.rel(here / name)}: symlinks and junctions are not allowed")
+                    self.error(f"{self.rel(here / name)}: symlinks and junctions are not allowed")
                     dirnames.remove(name)
             for name in filenames:
                 path = here / name
                 if _is_link(path):
-                    self.report.errors.append(f"{self.rel(path)}: symlinks and junctions are not allowed")
+                    self.error(f"{self.rel(path)}: symlinks and junctions are not allowed")
                 elif path.suffix.lower() not in ALLOWED_SUFFIXES:
-                    self.report.errors.append(
-                        f"{self.rel(path)}: file type not in the allow-list {sorted(ALLOWED_SUFFIXES)}")
+                    self.error(f"{self.rel(path)}: file type not in the allow-list {sorted(ALLOWED_SUFFIXES)} (2.4)")
                 else:
                     files.append(path)
         return sorted(files)
+
+    def check_sizes(self) -> None:
+        files = self.report.files
+        total = sum(p.stat().st_size for p in files)
+        if total >= MAX_TOTAL_BYTES:
+            self.error(f"total size {total:,} bytes is not under the 3 GiB limit (2.4)")
+        if len(files) > MAX_FILES:
+            self.error(f"{len(files)} files is over the {MAX_FILES:,}-file limit (2.4)")
+        yaml_files = [p for p in files if p.suffix.lower() in {".yaml", ".yml"}]
+        if len(yaml_files) > MAX_YAML_FILES:
+            self.error(f"{len(yaml_files)} YAML files is over the {MAX_YAML_FILES:,}-file limit (2.4)")
+        for path in yaml_files:
+            if path.stat().st_size > MAX_YAML_BYTES:
+                self.error(f"{self.rel(path)}: over the 50 MiB YAML limit (2.4)")
+        self.note(f"size: {len(files)} files, {total / 2**20:.2f} MiB of the 3 GiB limit")
+
+    def safe_path(self, raw: object, where: str, base: Path | None = None) -> Path | None:
+        """Return base/raw when raw is a safe relative path inside the archive; otherwise record why not.
+
+        Paths resolve from the folder of the file that holds them: the official
+        sample's sub_agents/code_analyzer.yaml includes ../prompts/analyzer.md.
+        """
+        if not isinstance(raw, str) or not raw.strip():
+            self.error(f"{where}: path must be a non-empty string, got {raw!r}")
+            return None
+        if "\0" in raw or "\\" in raw:
+            self.error(f"{where}: {raw!r} contains a null byte or backslash")
+            return None
+        pure = PurePosixPath(raw)
+        if pure.is_absolute() or re.match(r"^[A-Za-z]:", raw):
+            self.error(f"{where}: absolute path {raw!r} is not allowed (2.2)")
+            return None
+        target = Path(os.path.normpath((base or self.src).joinpath(*pure.parts)))
+        try:
+            target.resolve().relative_to(self.root)
+        except ValueError:
+            self.error(f"{where}: {raw!r} resolves outside the submission (2.2)")
+            return None
+        if ".." in pure.parts:
+            self.warn(f"{where}: {raw!r} uses '..'. The harness accepts it inside the archive (the official "
+                      f"sample does), but the competition overview says ../ isn't allowed. Keeping agent YAML at "
+                      f"the archive root avoids it")
+        return target
+
+    def resolve_ref(self, raw: object, where: str, base: Path | None = None) -> Path | None:
+        target = self.safe_path(raw, where, base)
+        if target is not None and not target.is_file():
+            self.error(f"{where}: {raw!r} not found")
+            return None
+        return target
 
     def load_yaml(self, path: Path) -> object:
         try:
             with path.open(encoding="utf-8") as fh:
                 return yaml.load(fh, Loader=_SubmissionLoader)  # SafeLoader subclass
         except (OSError, UnicodeDecodeError, yaml.YAMLError) as exc:
-            self.report.errors.append(f"{self.rel(path)}: cannot parse YAML ({exc})")
+            self.error(f"{self.rel(path)}: cannot parse YAML ({exc})")
             return None
 
-    def resolve_ref(self, raw: object, base: PurePosixPath, where: str) -> Path | None:
-        """Check one relative file reference and return the file it points to."""
-        target = self.safe_path(raw, base, where)
-        if target is not None and not target.is_file():
-            self.report.errors.append(f"{where}: {raw!r} not found (expected {self.rel(target)})")
-            return None
-        return target
-
-    def resolve_dir(self, raw: object, where: str) -> Path | None:
-        """Check a folder reference given from the archive root."""
-        return self.safe_path(raw, PurePosixPath("."), where)
-
-    def safe_path(self, raw: object, base: PurePosixPath, where: str) -> Path | None:
-        """Return src/base/raw when raw is a safe relative path; otherwise record why not."""
-        if not isinstance(raw, str) or not raw.strip():
-            self.report.errors.append(f"{where}: path must be a non-empty string, got {raw!r}")
-            return None
-        if "\\" in raw:
-            self.report.errors.append(f"{where}: use forward slashes in {raw!r}")
-            return None
-        pure = PurePosixPath(raw)
-        if pure.is_absolute() or re.match(r"^[A-Za-z]:", raw):
-            self.report.errors.append(f"{where}: absolute path {raw!r} is not allowed")
-            return None
-        if ".." in pure.parts:
-            self.report.errors.append(f"{where}: '..' is not allowed in {raw!r}")
-            return None
-        target = self.src.joinpath(*(base / pure).parts)
-        try:
-            target.resolve().relative_to(self.root)
-        except ValueError:
-            self.report.errors.append(f"{where}: {raw!r} resolves outside the submission")
-            return None
-        return target
-
-    def check_includes(self, node: object, path: Path) -> None:
-        """Check every `!include` in a loaded YAML tree, following YAML targets."""
+    def check_includes(self, node: object, path: Path, depth: int = 0) -> None:
+        """Check every `!include` in a loaded YAML tree, following YAML targets (2.2)."""
         rel = self.rel(path)
+        if depth >= MAX_INCLUDE_DEPTH:
+            self.error(f"{rel}: !include nesting is deeper than {MAX_INCLUDE_DEPTH} (2.2)")
+            return
         for inc in _iter_includes(node):
-            # Resolved from the archive root. UNVERIFIED: the ban on '..' only
-            # makes sense if paths never need to climb out of a subfolder.
-            target = self.resolve_ref(inc.path, PurePosixPath("."), f"{rel}: !include")
+            target = self.resolve_ref(inc.path, f"{rel}: !include", path.parent)
+            self.include_targets[(path.parent, inc.path)] = target
             if target is None:
                 continue
-            if path.parent != self.src:
-                self.report.warnings.append(
-                    f"{rel}: !include {inc.path!r} is resolved from the archive root; if the harness resolves "
-                    f"it from the file's folder it breaks. Keeping agent YAML at the root avoids the question.")
-            if target.suffix.lower() in {".yaml", ".yml"} and target not in self.includes_seen:
-                self.includes_seen.add(target)
-                self.check_includes(self.load_yaml(target), target)
+            suffix = target.suffix.lower()
+            if suffix in {".yaml", ".yml"}:
+                if target in self.include_stack:
+                    self.error(f"{rel}: !include cycle through {inc.path!r}")
+                    continue
+                self.include_stack.add(target)
+                self.check_includes(self.load_yaml(target), target, depth + 1)
+                self.include_stack.discard(target)
+            elif suffix not in {".md", ".txt"}:
+                self.warn(f"{rel}: !include {inc.path!r}: only .md, .txt, .yaml and .yml are documented (2.2)")
 
-    def check_agent(self, path: Path, is_root: bool = False) -> None:
-        if path in self.agents_seen:
+    def included_value(self, value: object, base: Path) -> object:
+        """What an `!include` in a file under base expands to: text for .md/.txt, parsed data for YAML."""
+        if not isinstance(value, Include):
+            return value
+        target = self.include_targets.get((base, value.path))
+        if target is None:
+            return None
+        if target.suffix.lower() in {".yaml", ".yml"}:
+            return self.load_yaml(target)
+        return target.read_text(encoding="utf-8")
+
+    # Agents
+
+    def check_agent_file(self, path: Path, is_root: bool = False) -> None:
+        if path in self.agent_files:
             return
-        self.agents_seen.add(path)
-        rel = self.rel(path)
+        self.agent_files.add(path)
         data = self.load_yaml(path)
         if data is None:
             return
-        if not isinstance(data, dict):
-            self.report.errors.append(f"{rel}: top level must be a mapping")
-            return
         self.check_includes(data, path)
-        base = PurePosixPath(path.parent.relative_to(self.src).as_posix())  # ADK: config_path is file-relative
+        self.check_agent(data, self.rel(path), path.parent, is_root)
 
-        model = data.get("model")
-        if model is None:
-            if is_root:
-                self.report.errors.append(f"{rel}: the root agent must set model")
-            else:
-                self.report.notes.append(f"{rel}: no model set, so ADK inherits the parent's")
-        elif not isinstance(model, str) or model not in ALLOWED_MODELS:
-            self.report.errors.append(f"{rel}: model {model!r} is not an allowed model {sorted(ALLOWED_MODELS)}")
-        else:
-            self.models[rel] = model
+    def check_agent(self, data: object, where: str, base: Path, is_root: bool = False) -> None:
+        """Check one agent mapping; base is the folder of the file it came from."""
+        if not isinstance(data, dict):
+            self.error(f"{where}: an agent must be a mapping")
+            return
+        self.agent_count += 1
+        if self.agent_count == MAX_AGENTS + 1:
+            self.error(f"more than {MAX_AGENTS} agents (2.4)")
+        agent_class = data.get("agent_class") or "LlmAgent"
+        if agent_class not in AGENT_CLASSES:
+            self.error(f"{where}: agent_class {agent_class!r} is not one of {', '.join(AGENT_CLASSES)} (2.3)")
+            return
+        allowed = LLM_AGENT_KEYS if agent_class == "LlmAgent" else WORKFLOW_AGENT_KEYS
+        unknown = sorted(set(data) - allowed)
+        if unknown:
+            self.error(f"{where}: {unknown} are not {agent_class} fields (2.3)")
+        if set(data) & CALLBACK_KEYS:
+            self.warn(f"{where}: callbacks resolve against the harness's CallbackRegistry, whose names aren't documented")
+        name = data.get("name")
+        if not isinstance(name, str) or not name.isidentifier() or name == "user":
+            self.error(f"{where}: name {name!r} must be a Python identifier other than 'user'")
 
-        tools = data.get("tools") or []
-        if not isinstance(tools, list):
-            self.report.errors.append(f"{rel}: tools must be a list")
-            tools = []
-        for i, tool in enumerate(tools):
-            where = f"{rel}: tools[{i}]"
-            if not isinstance(tool, dict) or not isinstance(tool.get("name"), str):
-                self.report.errors.append(f"{where}: each tool must be a mapping with a name (ADK ToolConfig)")
-                continue
-            name = tool["name"]
-            if name in HARNESS_TOOLS:
-                continue
-            if name in SKILL_TOOLS:
-                self.report.errors.append(
-                    f"{where}: {name} is added by the harness when skills are listed; do not declare it")
-            elif name in AGENT_TOOL_NAMES:
-                tool_args = tool.get("args")
-                agent_ref = tool_args.get("agent") if isinstance(tool_args, dict) else None
-                cfg = agent_ref.get("config_path") if isinstance(agent_ref, dict) else None
-                if cfg is None:
-                    self.report.errors.append(f"{where}: {name} needs args.agent.config_path")
-                    continue
-                target = self.resolve_ref(cfg, base, f"{where} config_path")
-                if target is not None:
-                    self.check_agent(target)
-            else:
-                self.report.errors.append(f"{where}: {name!r} is not a harness tool or an AgentTool")
+        if agent_class == "LlmAgent":
+            self.check_llm_agent(data, where, base, is_root)
+        elif agent_class == "LoopAgent" and "max_iterations" in data:
+            iterations = data["max_iterations"]
+            if isinstance(iterations, bool) or not isinstance(iterations, int) or not 1 <= iterations <= MAX_LOOP_ITERATIONS:
+                self.error(f"{where}: max_iterations must be an integer from 1 to {MAX_LOOP_ITERATIONS} (2.3)")
 
         sub_agents = data.get("sub_agents") or []
         if not isinstance(sub_agents, list):
-            self.report.errors.append(f"{rel}: sub_agents must be a list")
+            self.error(f"{where}: sub_agents must be a list")
             sub_agents = []
         for i, sub in enumerate(sub_agents):
-            where = f"{rel}: sub_agents[{i}]"
-            if not isinstance(sub, dict) or "config_path" not in sub:
-                self.report.errors.append(f"{where}: only config_path references are allowed (no code)")
-                continue
-            self.report.warnings.append(
-                f"{where}: transfer-style sub_agents are UNVERIFIED; the rules only mention AgentTool sub-agents")
-            target = self.resolve_ref(sub["config_path"], base, f"{where} config_path")
-            if target is not None:
-                self.check_agent(target)
-
-        adapter = data.get("adapter")  # UNVERIFIED key name and layout
-        if adapter is not None:
-            if isinstance(adapter, str) and "/" in adapter:
-                adapter_dir = self.resolve_dir(adapter, f"{rel}: adapter")
+            sub_where = f"{where}: sub_agents[{i}]"
+            if isinstance(sub, dict) and set(sub) == {"config_path"}:
+                target = self.resolve_ref(sub["config_path"], f"{sub_where} config_path", base)
+                if target is not None:
+                    self.check_agent_file(target)
             else:
-                adapter_dir = self.src / "adapters" / str(adapter)
-            if adapter_dir is not None and not adapter_dir.is_dir():
-                self.report.errors.append(f"{rel}: adapter {adapter!r} not found (expected {self.rel(adapter_dir)}/)")
+                self.error(f"{sub_where}: sub_agents entries are {{config_path: ...}} references (2.3)")
 
-        skills = data.get("skills") or []
-        if not isinstance(skills, list):
-            self.report.errors.append(f"{rel}: skills must be a list")
+    def check_llm_agent(self, data: dict, where: str, base: Path, is_root: bool) -> None:
+        model = data.get("model")
+        if model is None:
+            if is_root:
+                self.error(f"{where}: the root agent must set model (2.3)")
+        elif not isinstance(model, str) or _normalize_model(model) not in ALLOWED_MODELS:
+            self.error(f"{where}: model {model!r} is not in ALLOWED_MODEL_NAMES {sorted(ALLOWED_MODELS)} (3.2)")
+        else:
+            self.models[where] = _normalize_model(model)
+
+        for key in ("instruction", "global_instruction"):
+            if key in data:
+                self.check_instruction(self.included_value(data[key], base), f"{where}: {key}")
+        if "instruction" not in data:
+            self.warn(f"{where}: no instruction, so the agent runs on the harness prompt alone")
+        if isinstance(data.get("output_key"), str):
+            self.output_keys.add(data["output_key"])
+
+        tools = data.get("tools") or []
+        if not isinstance(tools, list):
+            self.error(f"{where}: tools must be a list")
+            tools = []
+        for i, tool in enumerate(tools):
+            self.check_tool(tool, f"{where}: tools[{i}]", base)
+
+        skills = data.get("skills")
+        if skills is not None and not isinstance(skills, list):
+            self.error(f"{where}: skills must be a list of folder paths (2.3)")
             skills = []
-        for i, skill in enumerate(skills):
-            if not isinstance(skill, str):
-                self.report.warnings.append(f"{rel}: skills[{i}] is not a string; the entry format is UNVERIFIED")
-            elif not any((d / "SKILL.md").is_file() for d in (self.src / skill, self.src / "skills" / skill)):
-                self.report.warnings.append(
-                    f"{rel}: skills[{i}] {skill!r} does not match a folder with SKILL.md (format UNVERIFIED)")
+        for i, skill in enumerate(skills or []):
+            target = self.safe_path(skill, f"{where}: skills[{i}]", base)
+            if target is not None and not (target / "SKILL.md").is_file():
+                self.error(f"{where}: skills[{i}] {skill!r} is not a folder holding SKILL.md (2.3)")
 
-    def check_skills(self) -> None:
+        adapter = data.get("adapter")
+        if adapter is not None:
+            if not isinstance(adapter, str) or not ADAPTER_NAME.match(adapter):
+                self.error(f"{where}: adapter {adapter!r} must match {ADAPTER_NAME.pattern} (3.4)")
+            elif not ((self.src / "adapters" / adapter).is_dir()
+                      or (self.src / "adapters" / f"{adapter}.safetensors").is_file()):
+                self.error(f"{where}: adapter {adapter!r} not found under adapters/ (3.4)")
+
+        if "generate_content_config" in data:
+            self.check_generation(self.included_value(data["generate_content_config"], base), where)
+
+    def check_tool(self, tool: object, where: str, base: Path) -> None:
+        if isinstance(tool, str):
+            if tool in SKILL_TOOLS:
+                self.error(f"{where}: {tool} comes with skills:; don't declare it as a tool (5.3)")
+            elif tool not in HARNESS_TOOLS:
+                self.error(f"{where}: {tool!r} is not one of the nine harness tools (6)")
+        elif isinstance(tool, dict) and "agent_tool" in tool:
+            if set(tool) != {"agent_tool"}:
+                self.error(f"{where}: an agent_tool entry takes no other keys")
+            ref = tool["agent_tool"]
+            if not isinstance(ref, dict) or "config_path" not in ref:
+                self.error(f"{where}: agent_tool needs config_path (2.3)")
+                return
+            extra = sorted(set(ref) - {"config_path", "skip_summarization"})
+            if extra:
+                self.warn(f"{where}: agent_tool keys {extra} aren't documented (2.3)")
+            target = self.resolve_ref(ref["config_path"], f"{where} agent_tool.config_path", base)
+            if target is not None:
+                self.check_agent_file(target)
+        elif isinstance(tool, dict) and "name" in tool and set(tool) <= {"name", "args"}:
+            self.error(f"{where}: plain-ADK {{name: ...}} entry; the harness reads mappings as inline agents. "
+                       f"List tools by bare name instead, e.g. '- {tool['name']}' (2.3)")
+        elif isinstance(tool, dict):
+            self.check_agent(tool, f"{where} (inline agent)", base)
+        else:
+            self.error(f"{where}: a tool is a name, an agent_tool reference or an inline agent (2.3)")
+
+    def check_instruction(self, text: object, where: str) -> None:
+        if text is None:
+            return  # a broken !include was already reported
+        if not isinstance(text, str):
+            self.error(f"{where}: must be text (inline, or !include of a .md or .txt file)")
+            return
+        if len(text) > MAX_INSTRUCTION_CHARS:
+            self.error(f"{where}: {len(text):,} characters is over the {MAX_INSTRUCTION_CHARS:,} limit (2.4)")
+        self.instruction_chars += len(text)
+        if self.instruction_chars > MAX_TOTAL_INSTRUCTION_CHARS:
+            self.error(f"instructions total more than {MAX_TOTAL_INSTRUCTION_CHARS:,} characters (2.4)")
+        for match in TEMPLATE.finditer(text):
+            name = match.group().strip("{}").strip()
+            optional = name.endswith("?")
+            name = name.rstrip("?")
+            if STATE_NAME.match(name):  # ADK leaves anything else in braces as literal text
+                self.templates.append((where, name, optional))
+
+    def check_templates(self) -> None:
+        for where, name, optional in self.templates:
+            if optional or name in STATE_VARS:
+                continue
+            if name in OPTIONAL_STATE_VARS:
+                self.error(f"{where}: write {{{name}?}}, not {{{name}}}: the harness sets {name} only when "
+                           f"the task has some, and ADK raises KeyError otherwise (5.1)")
+            elif name in self.output_keys:
+                self.warn(f"{where}: {{{name}}} is set only after the agent with output_key {name!r} has run")
+            else:
+                self.error(f"{where}: {{{name}}} is not session state the harness sets, so ADK raises KeyError. "
+                           f"Remove the braces if it's meant as plain text (5.1)")
+
+    def check_generation(self, gen: object, where: str) -> None:
+        where = f"{where}: generate_content_config"
+        if gen is None:
+            return
+        if not isinstance(gen, dict):
+            self.error(f"{where}: must be a mapping")
+            return
+        forbidden = sorted(set(gen) & GEN_FORBIDDEN)
+        if forbidden:
+            self.error(f"{where}: {forbidden} are not allowed (2.4)")
+        unknown = sorted(set(gen) - GEN_KEYS - GEN_FORBIDDEN)
+        if unknown:
+            self.warn(f"{where}: {unknown} aren't listed in the generation constraints (2.4)")
+        if "max_output_tokens" in gen and not _int_in(gen["max_output_tokens"], 1, MAX_CONTEXT_TOKENS):
+            self.error(f"{where}: max_output_tokens must be an integer from 1 to {MAX_CONTEXT_TOKENS} (2.4)")
+        if "temperature" in gen and not (_number(gen["temperature"]) and gen["temperature"] >= 0):
+            self.error(f"{where}: temperature must be a number >= 0 (2.4)")
+        if "top_p" in gen and not (_number(gen["top_p"]) and 0 <= gen["top_p"] <= 1):
+            self.error(f"{where}: top_p must be between 0 and 1 (2.4)")
+        if "top_k" in gen and not _int_in(gen["top_k"], 1, None):
+            self.error(f"{where}: top_k must be an integer >= 1 (2.4)")
+        thinking = gen.get("thinking_config")
+        if thinking is None:
+            return
+        if not isinstance(thinking, dict):
+            self.error(f"{where}: thinking_config must be a mapping")
+            return
+        if "thinking_budget" in thinking and not _int_in(thinking["thinking_budget"], 0, MAX_CONTEXT_TOKENS):
+            self.error(f"{where}: thinking_budget must be an integer from 0 to {MAX_CONTEXT_TOKENS} (2.4)")
+        level = thinking.get("thinking_level")
+        if level is not None and str(level).upper() not in THINKING_LEVELS:
+            self.error(f"{where}: thinking_level must be one of {sorted(THINKING_LEVELS)} (2.4)")
+        if level is not None:
+            self.warn(f"{where}: the README advises thinking_budget + include_thoughts instead of "
+                      f"thinking_level when serving through vLLM (2.4)")
+        if "include_thoughts" in thinking and not isinstance(thinking["include_thoughts"], bool):
+            self.error(f"{where}: include_thoughts must be true or false (2.4)")
+
+    def check_standalone_models(self) -> None:
+        """3.2: the model check also reads standalone agent YAML files anywhere in the archive."""
+        for path in self.report.files:
+            if path.suffix.lower() not in {".yaml", ".yml"} or path.name == "eval_config.yaml":
+                continue
+            if path in self.agent_files:
+                continue
+            data = self.load_yaml(path)
+            if isinstance(data, dict) and isinstance(data.get("model"), str):
+                self.models[self.rel(path)] = _normalize_model(data["model"])
+                if self.models[self.rel(path)] not in ALLOWED_MODELS:
+                    self.error(f"{self.rel(path)}: model {data['model']!r} is not in ALLOWED_MODEL_NAMES (3.2)")
+
+    def check_models(self) -> None:
+        distinct = set(self.models.values())
+        if not distinct and not self.report.errors:
+            self.error("no agent declares a model (3.2)")
+        if len(distinct) > 1:
+            listing = ", ".join(f"{where}: {model}" for where, model in sorted(self.models.items()))
+            self.error(f"every agent must use the same model ({listing}) (3.2)")
+
+    # Folders
+
+    def check_skill_dirs(self) -> None:
         skills_dir = self.src / "skills"
         if not skills_dir.is_dir():
             return
-        for skill in sorted(p for p in skills_dir.iterdir() if p.is_dir()):
+        skills = sorted(p for p in skills_dir.iterdir() if p.is_dir())
+        if len(skills) > MAX_SKILLS:
+            self.error(f"{len(skills)} skills is over the {MAX_SKILLS:,} limit (2.4)")
+        for skill in skills:
             rel = self.rel(skill)
+            size = sum(p.stat().st_size for p in skill.rglob("*") if p.is_file())
+            if size > MAX_SKILL_BYTES:
+                self.error(f"{rel}: {size:,} bytes is over the 50 MiB per-skill limit (2.4)")
             skill_md = skill / "SKILL.md"
             if not skill_md.is_file():
-                self.report.errors.append(f"{rel}: missing SKILL.md")
+                self.error(f"{rel}: missing SKILL.md")
                 continue
             meta = _frontmatter(skill_md.read_text(encoding="utf-8"))
             if not isinstance(meta, dict) or not meta.get("name"):
-                self.report.errors.append(f"{rel}/SKILL.md: frontmatter must set name")
+                self.error(f"{rel}/SKILL.md: frontmatter must set name")
+            elif not meta.get("description"):
+                self.warn(f"{rel}/SKILL.md: frontmatter has no description, so the model can't tell when to use it")
 
-    def check_adapters(self) -> None:
+    def check_adapter_dirs(self) -> None:
         adapters_dir = self.src / "adapters"
         if not adapters_dir.is_dir():
             return
         for adapter in sorted(p for p in adapters_dir.iterdir() if p.is_dir()):
+            rel = self.rel(adapter)
+            if not ADAPTER_NAME.match(adapter.name):
+                self.error(f"{rel}: adapter folder name must match {ADAPTER_NAME.pattern} (3.4)")
             for needed in ADAPTER_FILES:
                 if not (adapter / needed).is_file():
-                    self.report.errors.append(f"{self.rel(adapter)}: missing {needed}")
+                    self.error(f"{rel}: missing {needed} (3.4)")
+            config = adapter / "adapter_config.json"
+            if config.is_file():
+                try:
+                    rank = json.loads(config.read_text(encoding="utf-8")).get("r")
+                except (ValueError, AttributeError):
+                    self.error(f"{rel}/adapter_config.json: not a JSON object")
+                    continue
+                if isinstance(rank, int) and rank > MAX_LORA_RANK:
+                    self.error(f"{rel}: LoRA rank {rank} is over the max_lora_rank of {MAX_LORA_RANK} (3.1)")
+
+    # Budget
 
     def check_budget(self) -> None:
+        if (self.src / "eval_config.yml").is_file():
+            self.warn("eval_config.yml: only eval_config.yaml is documented (7.1)")
         cfg_path = self.src / "eval_config.yaml"
-        if not cfg_path.is_file():
-            self.report.warnings.append("no eval_config.yaml: harness defaults apply (check HARNESS_README.md)")
-            return
-        cfg = self.load_yaml(cfg_path)
-        if cfg is None:
-            return
-        if not isinstance(cfg, dict):
-            self.report.errors.append("eval_config.yaml: top level must be a mapping")
-            return
-        timeout = cfg.get(TIMEOUT_KEY)
-        if timeout is None:
-            self.report.warnings.append(f"eval_config.yaml: no {TIMEOUT_KEY}, so the 12 h budget can't be checked")
-            return
-        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout <= 0:
-            self.report.errors.append(f"eval_config.yaml: {TIMEOUT_KEY} must be a positive number, got {timeout!r}")
-            return
-        worst = self.tasks * (timeout + self.setup_seconds)
-        line = (f"budget: {self.tasks} tasks x ({timeout:g} s + {self.setup_seconds:g} s setup) = "
+        budget = dict(EVAL_DEFAULTS)
+        source = "scorer defaults"
+        if cfg_path.is_file():
+            cfg = self.load_yaml(cfg_path)
+            if cfg is None:
+                return
+            if not isinstance(cfg, dict) or not isinstance(cfg.get("evaluation"), dict):
+                self.error("eval_config.yaml: budgets go under an `evaluation:` mapping (7.1)")
+                return
+            if set(cfg) - {"evaluation"}:
+                self.warn(f"eval_config.yaml: {sorted(set(cfg) - {'evaluation'})} are not documented (7.1)")
+            for key, value in cfg["evaluation"].items():
+                if key not in EVAL_DEFAULTS:
+                    self.error(f"eval_config.yaml: evaluation.{key} is not a budget key; "
+                               f"use {', '.join(EVAL_DEFAULTS)} (7.1)")
+                elif not _number(value) or value <= 0:
+                    self.error(f"eval_config.yaml: evaluation.{key} must be a positive number, got {value!r}")
+                else:
+                    budget[key] = value
+            source = "eval_config.yaml"
+        minutes = budget["max_time_minutes"]
+        worst = self.tasks * (minutes * 60 + self.setup_seconds)
+        line = (f"budget ({source}): {self.tasks} tasks x ({minutes:g} min + {self.setup_seconds:g} s setup) = "
                 f"{worst / 3600:.1f} h of {TIME_CAP_SECONDS / 3600:g} h")
         if worst > TIME_CAP_SECONDS:
-            self.report.errors.append(f"{line}: over the cap, so the whole submission would fail")
+            self.error(f"{line}: over the cap if tasks use their full time, which fails the whole "
+                       f"submission. Lower evaluation.max_time_minutes")
         elif worst > WARN_FRACTION * TIME_CAP_SECONDS:
-            self.report.warnings.append(f"{line}: under {(1 - WARN_FRACTION):.0%} margin left")
+            self.warn(f"{line}: under {1 - WARN_FRACTION:.0%} margin left")
         else:
-            self.report.notes.append(line)
+            self.note(line)
+        self.note(f"per task: {budget['max_tool_calls']:g} tool calls, {budget['max_turns']:g} turns, "
+                  f"{budget['timeout_seconds']:g} s per command")
 
 
 def _is_link(path: Path) -> bool:
@@ -350,6 +604,22 @@ def _iter_includes(node: object):
             yield from _iter_includes(value)
 
 
+def _normalize_model(model: str) -> str:
+    for prefix in MODEL_PREFIXES:
+        if model.startswith(prefix):
+            return model[len(prefix):]
+    return model
+
+
+def _number(value: object) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _int_in(value: object, low: int, high: int | None) -> bool:
+    return (isinstance(value, int) and not isinstance(value, bool)
+            and value >= low and (high is None or value <= high))
+
+
 def _frontmatter(text: str) -> object:
     match = re.match(r"\A---\r?\n(.*?)\r?\n---\r?\n", text, re.DOTALL)
     if not match:
@@ -361,7 +631,7 @@ def _frontmatter(text: str) -> object:
 
 
 def validate(src: Path, tasks: int = HIDDEN_TASKS, setup_seconds: float = SETUP_SECONDS_PER_TASK) -> Report:
-    """Check a submission folder against the known rules. Writes nothing."""
+    """Check a submission folder against the harness rules. Writes nothing."""
     return _Checker(src, tasks, setup_seconds).run()
 
 
@@ -385,8 +655,8 @@ def check_zip(out: Path) -> list[str]:
     with zipfile.ZipFile(out) as zf:
         names = zf.namelist()
     errors = []
-    if "agent.yaml" not in names:
-        errors.append(f"{out.name}: agent.yaml is not at the archive root")
+    if sum(name in ROOT_CONFIG_NAMES for name in names) != 1:
+        errors.append(f"{out.name}: needs exactly one root config at the archive root")
     unsafe = [n for n in names if n.startswith("/") or "\\" in n or ".." in PurePosixPath(n).parts]
     if unsafe:
         errors.append(f"{out.name}: unsafe entry names {unsafe}")

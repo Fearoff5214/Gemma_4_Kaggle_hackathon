@@ -1,12 +1,12 @@
-# Per-task limits for the harness. Optional file.
+# Per-task budgets (data/HARNESS_README.md section 7.1), in the same format as
+# data/sample_submission/eval_config.yaml. Without this file the scorer's
+# defaults apply, including 60 min per task, which could blow the 12 h cap and
+# fail the whole submission.
 #
-# UNVERIFIED: the key names are the ones other teams report (their copy of the
-# sample config allows 1 min and 10 tool calls). Confirm names, units and the
-# defaults for omitted keys in data/HARNESS_README.md before the first submission.
-#
-# Budget: about 120 hidden tasks run one after another under a 12 h cap that
-# includes sandbox setup, and going over fails the whole submission.
-# 120 x (240 s + ~60 s setup) = 10 h, leaving about 2 h of margin.
-# scripts/build_submission.py prints this estimate on every build.
-per_task_timeout_seconds: 240
-max_turns_per_task: 40
+# 120 tasks x (4 min + ~1 min sandbox setup) = 10 h if tasks run one after
+# another. scripts/build_submission.py prints this estimate on every build.
+evaluation:
+  max_time_minutes: 4
+  max_tool_calls: 60
+  max_turns: 100
+  timeout_seconds: 120

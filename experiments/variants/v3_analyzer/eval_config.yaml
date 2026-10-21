@@ -1,4 +1,12 @@
-# Same limits as baseline v0 (see submission/eval_config.yaml), so the only
-# difference between v0 and v1 is the prompt.
-per_task_timeout_seconds: 240
-max_turns_per_task: 40
+# Per-task budgets (data/HARNESS_README.md section 7.1), in the same format as
+# data/sample_submission/eval_config.yaml. Without this file the scorer's
+# defaults apply, including 60 min per task, which could blow the 12 h cap and
+# fail the whole submission.
+#
+# 120 tasks x (4 min + ~1 min sandbox setup) = 10 h if tasks run one after
+# another. scripts/build_submission.py prints this estimate on every build.
+evaluation:
+  max_time_minutes: 4
+  max_tool_calls: 60
+  max_turns: 100
+  timeout_seconds: 120
