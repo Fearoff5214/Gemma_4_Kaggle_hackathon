@@ -1,0 +1,27 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/google/adk-python/refs/heads/main/src/google/adk/agents/config_schemas/AgentConfig.json
+#
+# Variant v2_skills: v1_workflow plus two skills (repo navigation, running
+# tests). One change against v1: the skills, and the prompt line naming them.
+#
+# UNVERIFIED: the `skills:` entry format (folder path or name) and how the
+# harness exposes skills. Other teams report that listing skills adds the
+# run_skill_script and load_skill_resource tools automatically, so they are
+# not declared here.
+agent_class: LlmAgent
+name: swe_agent
+model: gemma-4-31b-it-qat-w4a16-ct
+description: Fixes one GitHub issue in a Python repository and submits the patch.
+instruction: !include prompts/system.md
+tools:
+  - name: run_command
+  - name: read_file
+  - name: edit_file
+  - name: write_file
+  - name: get_code_neighbors
+  - name: search_similar_code
+  - name: get_code_subgraph
+  - name: get_status
+  - name: submit_patch
+skills:
+  - skills/repo_navigation
+  - skills/running_tests

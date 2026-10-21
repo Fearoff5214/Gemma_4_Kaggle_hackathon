@@ -1,0 +1,13 @@
+# Read-only analyzer used by v3_analyzer/agent.yaml through AgentTool.
+# It has no run_command, edit_file or write_file, so it can't change the repo.
+# It must use the same model as the root agent (competition rule).
+agent_class: LlmAgent
+name: code_analyzer
+model: gemma-4-31b-it-qat-w4a16-ct
+description: Read-only helper. Give it a one-paragraph summary of the issue; it finds the files and functions most likely involved and replies with a short report. It never edits files.
+instruction: !include prompts/analyzer.md
+tools:
+  - name: read_file
+  - name: get_code_neighbors
+  - name: search_similar_code
+  - name: get_code_subgraph
