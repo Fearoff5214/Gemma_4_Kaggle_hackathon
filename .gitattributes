@@ -1,0 +1,8 @@
+# Keep LF endings for everything that goes into submission.zip, so a build on
+# Windows (core.autocrlf=true) produces the same bytes as one on Linux.
+submission/** text eol=lf
+experiments/variants/** text eol=lf
+*.py text eol=lf
+# sh fails on CRLF line endings in hook scripts
+scripts/hooks/* text eol=lf
+*.safetensors binary

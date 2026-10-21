@@ -1,0 +1,12 @@
+# Per-task limits for the harness. Optional file.
+#
+# UNVERIFIED: the key names are the ones other teams report (their copy of the
+# sample config allows 1 min and 10 tool calls). Confirm names, units and the
+# defaults for omitted keys in data/HARNESS_README.md before the first submission.
+#
+# Budget: about 120 hidden tasks run one after another under a 12 h cap that
+# includes sandbox setup, and going over fails the whole submission.
+# 120 x (240 s + ~60 s setup) = 10 h, leaving about 2 h of margin.
+# scripts/build_submission.py prints this estimate on every build.
+per_task_timeout_seconds: 240
+max_turns_per_task: 40

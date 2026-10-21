@@ -1,0 +1,4 @@
+# Same limits as baseline v0 (see submission/eval_config.yaml), so the only
+# difference between v0 and v1 is the prompt.
+per_task_timeout_seconds: 240
+max_turns_per_task: 40
