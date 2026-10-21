@@ -1,0 +1,20 @@
+# Competition data, model weights and build output stay out of git
+data/
+dist/
+*.zip
+*.safetensors
+*.bin
+*.gguf
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Secrets: Kaggle API tokens and local env files
+kaggle.json
+access_token
+.env
+.env.*
+!.env.example
