@@ -2,7 +2,7 @@
 
 This is the team repo for the [Google - Gemma 4 Developer Agent Competition](https://www.kaggle.com/competitions/gemma-4-developer-agent) on Kaggle. The job is to post-train one Gemma 4 variant into an agent that fixes real repository issues. The score is the share of patched repos that pass their validation tests, as in SWE-bench. The final submission is due **December 2, 2026 at 11:59 PM UTC** (5:29 AM IST on December 3).
 
-**Status, 2026-10-21:** Phase 0 (setup and baseline). The baseline in `submission/` follows `data/HARNESS_README.md` and the official `data/sample_submission/`, and passes the validator, but it hasn't been submitted. See `docs/harness_notes.md` for the harness facts, `docs/dataset_inventory.md` and `docs/sandbox_environment.md` for the data and sandbox, and `experiments/variants/README.md` for the experiment queue. The full plan is in the [six-week plan doc](https://claude.ai/artifact/A9usjMjJLXXoXBT4nXpFax).
+**Status, 2026-10-21:** Phase 0 (setup and baseline). The baseline in `submission/` follows `data/HARNESS_README.md` and the official `data/sample_submission/`, and passes the validator, but it hasn't been submitted. See `docs/harness_notes.md` for the harness facts, `docs/dataset_inventory.md` and `docs/sandbox_environment.md` for the data and sandbox, and `experiments/variants/README.md` for the experiment queue. The full plan is in the [six-week plan doc](https://claude.ai/artifact/A9usjMjJLXXoXBT4nXpFax). For what to do next and what's pending, see [What's Next](https://claude.ai/artifact/YW68oyB7rJMgg8rViWVSNn).
 
 ## Layout
 
