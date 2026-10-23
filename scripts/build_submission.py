@@ -15,7 +15,9 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
+import posixpath
 import re
 import shutil
 import sys
@@ -63,6 +65,7 @@ GEN_KEYS = frozenset({
 })
 GEN_FORBIDDEN = frozenset({"tools", "system_instruction", "http_options", "safety_settings", "response_schema"})
 THINKING_LEVELS = frozenset({"MINIMAL", "LOW", "MEDIUM", "HIGH", "NONE"})
+THINKING_KEYS = frozenset({"thinking_budget", "thinking_level", "include_thoughts"})
 MAX_CONTEXT_TOKENS = 32_768
 # 2.4: structural limits.
 MAX_TOTAL_BYTES = 3_221_225_472  # total unpacked size must stay below this, adapters included
@@ -88,6 +91,8 @@ TEMPLATE = re.compile(r"\{+[^{}]*\}+")
 STATE_NAME = re.compile(r"(?:(?:app|user|temp):)?[A-Za-z_][A-Za-z0-9_]*\Z")
 # 7.1: eval_config.yaml keys under `evaluation:`, with the scorer's defaults.
 EVAL_DEFAULTS = {"max_time_minutes": 60.0, "max_tool_calls": 100, "max_turns": 500, "timeout_seconds": 300}
+EVAL_INT_KEYS = frozenset({"max_tool_calls", "max_turns"})
+PARSE_ERROR = object()  # load_yaml's result for a file it couldn't parse (already reported)
 
 # The competition's 12 h cap covers every task, sandbox setup included (setup is
 # excluded from max_time_minutes, 7.1). ESTIMATE: the hidden task count, setup
@@ -134,6 +139,10 @@ class _Checker:
         self.setup_seconds = setup_seconds
         self.report = Report()
         self.agent_files: set[Path] = set()
+        self.agent_stack: set[Path] = set()  # agent files being checked, to catch config_path cycles
+        # Exact, case-sensitive relative names of every file in the archive. The scorer
+        # runs on Linux, so a reference has to match these exactly even on Windows.
+        self.names: set[str] = set()
         self.include_targets: dict[tuple[Path, str], Path | None] = {}  # (folder, raw path) -> checked target
         self.include_stack: set[Path] = set()
         self.models: dict[str, str] = {}
@@ -156,8 +165,9 @@ class _Checker:
 
     def run(self) -> Report:
         self.report.files = self.walk_files()
+        self.names = {self.rel(p) for p in self.report.files}
         self.check_sizes()
-        roots = [self.src / name for name in ROOT_CONFIG_NAMES if (self.src / name).is_file()]
+        roots = [self.src / name for name in ROOT_CONFIG_NAMES if name in self.names]
         if not roots:
             nested = [self.rel(p) for p in self.report.files if p.name in ROOT_CONFIG_NAMES]
             found = f" (found {', '.join(nested)})" if nested else ""
@@ -192,7 +202,7 @@ class _Checker:
                     self.error(f"{self.rel(path)}: file type not in the allow-list {sorted(ALLOWED_SUFFIXES)} (2.4)")
                 else:
                     files.append(path)
-        return sorted(files)
+        return sorted(files, key=lambda p: self.rel(p))  # case-sensitive, the same on every OS
 
     def check_sizes(self) -> None:
         files = self.report.files
@@ -225,12 +235,14 @@ class _Checker:
         if pure.is_absolute() or re.match(r"^[A-Za-z]:", raw):
             self.error(f"{where}: absolute path {raw!r} is not allowed (2.2)")
             return None
-        target = Path(os.path.normpath((base or self.src).joinpath(*pure.parts)))
-        try:
-            target.resolve().relative_to(self.root)
-        except ValueError:
+        # Normalise relative to the archive root as text, so a path can't leave the
+        # folder and come back in through the folder's own name.
+        base_rel = (base or self.src).relative_to(self.src).as_posix()
+        rel = posixpath.normpath(posixpath.join(base_rel, raw))
+        if rel == ".." or rel.startswith("../"):
             self.error(f"{where}: {raw!r} resolves outside the submission (2.2)")
             return None
+        target = self.src / rel
         if ".." in pure.parts:
             self.warn(f"{where}: {raw!r} uses '..'. The harness accepts it inside the archive (the official "
                       f"sample does), but the competition overview says ../ isn't allowed. Keeping agent YAML at "
@@ -239,17 +251,25 @@ class _Checker:
 
     def resolve_ref(self, raw: object, where: str, base: Path | None = None) -> Path | None:
         target = self.safe_path(raw, where, base)
-        if target is not None and not target.is_file():
-            self.error(f"{where}: {raw!r} not found")
+        if target is not None and self.rel(target) not in self.names:
+            self.error(f"{where}: {raw!r} not found (names are case-sensitive on the scorer)")
             return None
         return target
 
     def load_yaml(self, path: Path) -> object:
+        """Parsed YAML (None for an empty file), or PARSE_ERROR after reporting why."""
         try:
             with path.open(encoding="utf-8") as fh:
                 return yaml.load(fh, Loader=_SubmissionLoader)  # SafeLoader subclass
-        except (OSError, UnicodeDecodeError, yaml.YAMLError) as exc:
+        except (OSError, UnicodeDecodeError, yaml.YAMLError, RecursionError) as exc:
             self.error(f"{self.rel(path)}: cannot parse YAML ({exc})")
+            return PARSE_ERROR
+
+    def read_text(self, path: Path) -> str | None:
+        try:
+            return path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            self.error(f"{self.rel(path)}: cannot read as UTF-8 text ({exc})")
             return None
 
     def check_includes(self, node: object, path: Path, depth: int = 0) -> None:
@@ -282,20 +302,29 @@ class _Checker:
         if target is None:
             return None
         if target.suffix.lower() in {".yaml", ".yml"}:
-            return self.load_yaml(target)
-        return target.read_text(encoding="utf-8")
+            data = self.load_yaml(target)
+            return None if data is PARSE_ERROR else data
+        return self.read_text(target)
 
     # Agents
 
     def check_agent_file(self, path: Path, is_root: bool = False) -> None:
+        if path in self.agent_stack:
+            self.error(f"{self.rel(path)}: config_path cycle; an agent can't contain itself (2.4)")
+            return
         if path in self.agent_files:
             return
         self.agent_files.add(path)
         data = self.load_yaml(path)
-        if data is None:
+        if data is PARSE_ERROR:
             return
+        if data is None:
+            self.error(f"{self.rel(path)}: agent file is empty")
+            return
+        self.agent_stack.add(path)
         self.check_includes(data, path)
         self.check_agent(data, self.rel(path), path.parent, is_root)
+        self.agent_stack.discard(path)
 
     def check_agent(self, data: object, where: str, base: Path, is_root: bool = False) -> None:
         """Check one agent mapping; base is the folder of the file it came from."""
@@ -310,7 +339,7 @@ class _Checker:
             self.error(f"{where}: agent_class {agent_class!r} is not one of {', '.join(AGENT_CLASSES)} (2.3)")
             return
         allowed = LLM_AGENT_KEYS if agent_class == "LlmAgent" else WORKFLOW_AGENT_KEYS
-        unknown = sorted(set(data) - allowed)
+        unknown = _sorted_keys(set(data) - allowed)
         if unknown:
             self.error(f"{where}: {unknown} are not {agent_class} fields (2.3)")
         if set(data) & CALLBACK_KEYS:
@@ -326,7 +355,8 @@ class _Checker:
             if isinstance(iterations, bool) or not isinstance(iterations, int) or not 1 <= iterations <= MAX_LOOP_ITERATIONS:
                 self.error(f"{where}: max_iterations must be an integer from 1 to {MAX_LOOP_ITERATIONS} (2.3)")
 
-        sub_agents = data.get("sub_agents") or []
+        sub_agents = data.get("sub_agents")
+        sub_agents = [] if sub_agents is None else sub_agents
         if not isinstance(sub_agents, list):
             self.error(f"{where}: sub_agents must be a list")
             sub_agents = []
@@ -357,7 +387,8 @@ class _Checker:
         if isinstance(data.get("output_key"), str):
             self.output_keys.add(data["output_key"])
 
-        tools = data.get("tools") or []
+        tools = data.get("tools")
+        tools = [] if tools is None else tools
         if not isinstance(tools, list):
             self.error(f"{where}: tools must be a list")
             tools = []
@@ -370,15 +401,15 @@ class _Checker:
             skills = []
         for i, skill in enumerate(skills or []):
             target = self.safe_path(skill, f"{where}: skills[{i}]", base)
-            if target is not None and not (target / "SKILL.md").is_file():
+            if target is not None and f"{self.rel(target)}/SKILL.md" not in self.names:
                 self.error(f"{where}: skills[{i}] {skill!r} is not a folder holding SKILL.md (2.3)")
 
         adapter = data.get("adapter")
         if adapter is not None:
             if not isinstance(adapter, str) or not ADAPTER_NAME.match(adapter):
                 self.error(f"{where}: adapter {adapter!r} must match {ADAPTER_NAME.pattern} (3.4)")
-            elif not ((self.src / "adapters" / adapter).is_dir()
-                      or (self.src / "adapters" / f"{adapter}.safetensors").is_file()):
+            elif not (f"adapters/{adapter}.safetensors" in self.names
+                      or any(n.startswith(f"adapters/{adapter}/") for n in self.names)):
                 self.error(f"{where}: adapter {adapter!r} not found under adapters/ (3.4)")
 
         if "generate_content_config" in data:
@@ -397,7 +428,7 @@ class _Checker:
             if not isinstance(ref, dict) or "config_path" not in ref:
                 self.error(f"{where}: agent_tool needs config_path (2.3)")
                 return
-            extra = sorted(set(ref) - {"config_path", "skip_summarization"})
+            extra = _sorted_keys(set(ref) - {"config_path", "skip_summarization"})
             if extra:
                 self.warn(f"{where}: agent_tool keys {extra} aren't documented (2.3)")
             target = self.resolve_ref(ref["config_path"], f"{where} agent_tool.config_path", base)
@@ -449,12 +480,12 @@ class _Checker:
         if not isinstance(gen, dict):
             self.error(f"{where}: must be a mapping")
             return
-        forbidden = sorted(set(gen) & GEN_FORBIDDEN)
+        forbidden = _sorted_keys(set(gen) & GEN_FORBIDDEN)
         if forbidden:
             self.error(f"{where}: {forbidden} are not allowed (2.4)")
-        unknown = sorted(set(gen) - GEN_KEYS - GEN_FORBIDDEN)
+        unknown = _sorted_keys(set(gen) - GEN_KEYS - GEN_FORBIDDEN)
         if unknown:
-            self.warn(f"{where}: {unknown} aren't listed in the generation constraints (2.4)")
+            self.error(f"{where}: {unknown} aren't generation fields; check the spelling (2.4)")
         if "max_output_tokens" in gen and not _int_in(gen["max_output_tokens"], 1, MAX_CONTEXT_TOKENS):
             self.error(f"{where}: max_output_tokens must be an integer from 1 to {MAX_CONTEXT_TOKENS} (2.4)")
         if "temperature" in gen and not (_number(gen["temperature"]) and gen["temperature"] >= 0):
@@ -469,6 +500,9 @@ class _Checker:
         if not isinstance(thinking, dict):
             self.error(f"{where}: thinking_config must be a mapping")
             return
+        unknown = _sorted_keys(set(thinking) - THINKING_KEYS)
+        if unknown:
+            self.error(f"{where}: {unknown} aren't thinking_config fields; check the spelling (2.4)")
         if "thinking_budget" in thinking and not _int_in(thinking["thinking_budget"], 0, MAX_CONTEXT_TOKENS):
             self.error(f"{where}: thinking_budget must be an integer from 0 to {MAX_CONTEXT_TOKENS} (2.4)")
         level = thinking.get("thinking_level")
@@ -515,11 +549,13 @@ class _Checker:
             size = sum(p.stat().st_size for p in skill.rglob("*") if p.is_file())
             if size > MAX_SKILL_BYTES:
                 self.error(f"{rel}: {size:,} bytes is over the 50 MiB per-skill limit (2.4)")
-            skill_md = skill / "SKILL.md"
-            if not skill_md.is_file():
-                self.error(f"{rel}: missing SKILL.md")
+            if f"{rel}/SKILL.md" not in self.names:
+                self.error(f"{rel}: missing SKILL.md (the name is case-sensitive)")
                 continue
-            meta = _frontmatter(skill_md.read_text(encoding="utf-8"))
+            text = self.read_text(skill / "SKILL.md")
+            if text is None:
+                continue
+            meta = _frontmatter(text)
             if not isinstance(meta, dict) or not meta.get("name"):
                 self.error(f"{rel}/SKILL.md: frontmatter must set name")
             elif not meta.get("description"):
@@ -540,7 +576,7 @@ class _Checker:
             if config.is_file():
                 try:
                     rank = json.loads(config.read_text(encoding="utf-8")).get("r")
-                except (ValueError, AttributeError):
+                except (OSError, ValueError, AttributeError):
                     self.error(f"{rel}/adapter_config.json: not a JSON object")
                     continue
                 if isinstance(rank, int) and rank > MAX_LORA_RANK:
@@ -549,29 +585,36 @@ class _Checker:
     # Budget
 
     def check_budget(self) -> None:
-        if (self.src / "eval_config.yml").is_file():
-            self.warn("eval_config.yml: only eval_config.yaml is documented (7.1)")
-        cfg_path = self.src / "eval_config.yaml"
+        misnamed = [n for n in self.names if n.lower() in {"eval_config.yaml", "eval_config.yml"}
+                    and n != "eval_config.yaml"]
+        for name in misnamed:
+            self.error(f"{name}: the scorer only reads eval_config.yaml (exact name, at the root) (7.1)")
         budget = dict(EVAL_DEFAULTS)
         source = "scorer defaults"
-        if cfg_path.is_file():
-            cfg = self.load_yaml(cfg_path)
-            if cfg is None:
+        if "eval_config.yaml" in self.names:
+            cfg = self.load_yaml(self.src / "eval_config.yaml")
+            if cfg is PARSE_ERROR:
                 return
-            if not isinstance(cfg, dict) or not isinstance(cfg.get("evaluation"), dict):
+            if cfg is None:
+                self.warn("eval_config.yaml is empty, so the scorer defaults apply")
+            elif not isinstance(cfg, dict) or not isinstance(cfg.get("evaluation"), dict):
                 self.error("eval_config.yaml: budgets go under an `evaluation:` mapping (7.1)")
                 return
-            if set(cfg) - {"evaluation"}:
-                self.warn(f"eval_config.yaml: {sorted(set(cfg) - {'evaluation'})} are not documented (7.1)")
-            for key, value in cfg["evaluation"].items():
-                if key not in EVAL_DEFAULTS:
-                    self.error(f"eval_config.yaml: evaluation.{key} is not a budget key; "
-                               f"use {', '.join(EVAL_DEFAULTS)} (7.1)")
-                elif not _number(value) or value <= 0:
-                    self.error(f"eval_config.yaml: evaluation.{key} must be a positive number, got {value!r}")
-                else:
-                    budget[key] = value
-            source = "eval_config.yaml"
+            else:
+                extra = _sorted_keys(set(cfg) - {"evaluation"})
+                if extra:
+                    self.warn(f"eval_config.yaml: {extra} are not documented (7.1)")
+                for key, value in cfg["evaluation"].items():
+                    if key not in EVAL_DEFAULTS:
+                        self.error(f"eval_config.yaml: evaluation.{key} is not a budget key; "
+                                   f"use {', '.join(EVAL_DEFAULTS)} (7.1)")
+                    elif key in EVAL_INT_KEYS and not _int_in(value, 1, None):
+                        self.error(f"eval_config.yaml: evaluation.{key} must be a positive integer, got {value!r}")
+                    elif not _number(value) or value <= 0:
+                        self.error(f"eval_config.yaml: evaluation.{key} must be a positive number, got {value!r}")
+                    else:
+                        budget[key] = value
+                source = "eval_config.yaml"
         minutes = budget["max_time_minutes"]
         worst = self.tasks * (minutes * 60 + self.setup_seconds)
         line = (f"budget ({source}): {self.tasks} tasks x ({minutes:g} min + {self.setup_seconds:g} s setup) = "
@@ -593,15 +636,22 @@ def _is_link(path: Path) -> bool:
     return path.is_symlink() or isjunction(path)
 
 
-def _iter_includes(node: object):
+def _iter_includes(node: object, seen: set[int] | None = None):
+    # YAML aliases can share or nest nodes, so visit each container once.
+    seen = set() if seen is None else seen
     if isinstance(node, Include):
         yield node
-    elif isinstance(node, dict):
-        for value in node.values():
-            yield from _iter_includes(value)
-    elif isinstance(node, list):
-        for value in node:
-            yield from _iter_includes(value)
+    elif isinstance(node, (dict, list)):
+        if id(node) in seen:
+            return
+        seen.add(id(node))
+        for value in node.values() if isinstance(node, dict) else node:
+            yield from _iter_includes(value, seen)
+
+
+def _sorted_keys(keys) -> list[str]:
+    # YAML keys can be booleans or numbers (`on:` loads as True), so compare as text.
+    return sorted(map(str, keys))
 
 
 def _normalize_model(model: str) -> str:
@@ -612,7 +662,7 @@ def _normalize_model(model: str) -> str:
 
 
 def _number(value: object) -> bool:
-    return isinstance(value, (int, float)) and not isinstance(value, bool)
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
 
 
 def _int_in(value: object, low: int, high: int | None) -> bool:
@@ -621,7 +671,7 @@ def _int_in(value: object, low: int, high: int | None) -> bool:
 
 
 def _frontmatter(text: str) -> object:
-    match = re.match(r"\A---\r?\n(.*?)\r?\n---\r?\n", text, re.DOTALL)
+    match = re.match(r"\A---\r?\n(.*?)\r?\n---[ \t]*(?:\r?\n|\Z)", text, re.DOTALL)
     if not match:
         return None
     try:
@@ -643,6 +693,7 @@ def build_zip(src: Path, files: list[Path], out: Path) -> None:
         for path in files:
             info = zipfile.ZipInfo(path.relative_to(src).as_posix(), date_time=FIXED_ZIP_TIME)
             info.compress_type = zipfile.ZIP_DEFLATED
+            info.create_system = 3  # Unix, whatever OS builds it, so builds match byte for byte
             info.external_attr = 0o644 << 16
             large = path.stat().st_size >= zipfile.ZIP64_LIMIT
             with path.open("rb") as fh, zf.open(info, "w", force_zip64=large) as dst:

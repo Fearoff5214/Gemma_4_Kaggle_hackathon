@@ -278,6 +278,82 @@ class BudgetTests(FixtureMixin, unittest.TestCase):
         self.assert_error("evaluation.max_minutes is not a budget key")
 
 
+class ReviewRegressionTests(FixtureMixin, unittest.TestCase):
+    """Holes found in the 2026-10-21 review; the scorer runs on case-sensitive Linux."""
+
+    def test_wrong_case_include_rejected(self):
+        self.write("agent.yaml", BASE_AGENT.replace("prompts/system.md", "Prompts/SYSTEM.md"))
+        self.assert_error("not found")
+
+    def test_trailing_dot_folder_rejected(self):
+        self.write("agent.yaml", BASE_AGENT.replace("prompts/system.md", "prompts./system.md"))
+        self.assert_error("not found")
+
+    def test_wrong_case_eval_config_rejected(self):
+        (self.src / "eval_config.yaml").rename(self.src / "EVAL_CONFIG.yaml")
+        self.assert_error("only reads eval_config.yaml")
+
+    def test_wrong_case_skill_md_rejected(self):
+        self.write("agent.yaml", BASE_AGENT + "skills:\n  - skills/nav\n")
+        self.write("skills/nav/skill.md", "---\nname: nav\n---\n")
+        self.assert_error("is not a folder holding SKILL.md")
+
+    def test_empty_eval_config_uses_defaults_and_fails_budget(self):
+        self.write("eval_config.yaml", "# nothing yet\n")
+        self.assert_error("over the cap")
+
+    def test_empty_sub_agent_file_rejected(self):
+        self.write("agent.yaml", BASE_AGENT + ANALYZER_TOOL)
+        self.write("sub_agents/analyzer.yaml", "# TODO\n")
+        self.assert_error("agent file is empty")
+
+    def test_reentry_through_folder_name_rejected(self):
+        self.write("agent.yaml", BASE_AGENT.replace("prompts/system.md", "../submission/prompts/system.md"))
+        self.assert_error("resolves outside the submission")
+
+    def test_nan_budget_rejected(self):
+        self.write("eval_config.yaml", "evaluation:\n  max_time_minutes: .nan\n")
+        self.assert_error("must be a positive number")
+
+    def test_fractional_tool_calls_rejected(self):
+        self.write("eval_config.yaml", "evaluation:\n  max_time_minutes: 4\n  max_tool_calls: 10.5\n")
+        self.assert_error("must be a positive integer")
+
+    def test_config_path_cycle_rejected(self):
+        self.write("agent.yaml", BASE_AGENT + ANALYZER_TOOL)
+        self.write("sub_agents/analyzer.yaml", ANALYZER + "  - agent_tool:\n      config_path: ../agent.yaml\n")
+        self.assert_error("config_path cycle")
+
+    def test_generation_typo_rejected(self):
+        self.write("agent.yaml", BASE_AGENT + "generate_content_config:\n  max_ouput_tokens: 4096\n")
+        self.assert_error("aren't generation fields")
+
+    def test_thinking_typo_rejected(self):
+        self.write("agent.yaml", BASE_AGENT + "generate_content_config:\n  thinking_config:\n    thinking_budjet: 9\n")
+        self.assert_error("aren't thinking_config fields")
+
+    def test_mixed_type_keys_do_not_crash(self):
+        self.write("agent.yaml", BASE_AGENT + "on: x\ninstructions: y\n")
+        self.assert_error("are not LlmAgent fields")
+
+    def test_non_utf8_prompt_reported(self):
+        (self.src / "prompts" / "system.md").write_bytes("caf\xe9\n".encode("cp1252"))
+        self.assert_error("cannot read as UTF-8")
+
+    def test_recursive_alias_does_not_crash(self):
+        self.write("agent.yaml", BASE_AGENT + "description: &a [*a]\n")
+        bs.validate(self.src)  # must return, not raise RecursionError
+
+    def test_tools_mapping_rejected(self):
+        self.write("agent.yaml", BASE_AGENT.split("tools:")[0] + "tools: {}\n")
+        self.assert_error("tools must be a list")
+
+    def test_frontmatter_without_trailing_newline_passes(self):
+        self.write("agent.yaml", BASE_AGENT + "skills:\n  - skills/nav\n")
+        self.write("skills/nav/SKILL.md", "---\nname: nav\ndescription: d\n---")
+        self.assert_clean()
+
+
 class BuildTests(FixtureMixin, unittest.TestCase):
     def test_zip_has_agent_yaml_at_root(self):
         out = self.tmp / "out" / "submission.zip"
